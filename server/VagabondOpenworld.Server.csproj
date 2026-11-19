@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <AssemblyName>VagabondOpenworld.Server</AssemblyName>
+        <RootNamespace>OpenworldAddon.Server</RootNamespace>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <OutputType>Library</OutputType>
+        <LangVersion>latest</LangVersion>
+        <Version>1.0.0</Version>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <OutputPath>bin\$(Configuration)\</OutputPath>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <!-- Root of your SPT install; override with: dotnet build -c Release -p:TarkovDir="C:\path\to\SPT\" -->
+        <TarkovDir Condition=" '$(TarkovDir)' == '' ">D:\SPT-dev\</TarkovDir>
+        <!-- Folder of the installed Vagabond SERVER mod (contains Vagabond.Common.dll) -->
+        <VagabondServerDir Condition=" '$(VagabondServerDir)' == '' ">$(TarkovDir)SPT_Runtime\user\mods\Vagabond\</VagabondServerDir>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="SPTushonka.Common" Version="4.1.6"/>
+        <PackageReference Include="SPTushonka.DI" Version="4.1.6"/>
+        <PackageReference Include="SPTushonka.Server.Core" Version="4.1.6"/>
+        <Reference Include="Vagabond.Common">
+            <HintPath>$(VagabondServerDir)Vagabond.Common.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
+    </ItemGroup>
+</Project>
