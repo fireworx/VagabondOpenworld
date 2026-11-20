@@ -18,6 +18,17 @@ public static class ZoneLookup
 {
     private static Dictionary<string, List<string>> _traderMap;
     private static float _nextFetch;
+    private static bool _fence;
+
+    /// <summary>True when Vagabond's setting puts Fence at the player's hideout (asked from our server together with the map).</summary>
+    public static bool FenceAtHideout
+    {
+        get
+        {
+            GetTraderMap();
+            return _fence;
+        }
+    }
 
     /// <summary>exfil identifier -> trader ids, from our server mod (Vagabond's public API).</summary>
     private static Dictionary<string, List<string>> GetTraderMap()
@@ -37,6 +48,29 @@ public static class ZoneLookup
         {
             var json = RequestHandler.PostJson("/vagabond-openworld/map", "{}");
             var map = JsonConvert.DeserializeObject<Dictionary<string, List<string>>>(json);
+            Plugin.PushRules();
+            try
+            {
+                _fence = (bool?)Newtonsoft.Json.Linq.JObject.Parse(RequestHandler.PostJson("/vagabond-openworld/fence", "{}"))["Enabled"] ?? false;
+            }
+            catch (Exception fenceError)
+            {
+                Plugin.LogError("Could not ask for Fence at the hideout: " + fenceError.Message);
+            }
+
+            if (Plugin.FileLogEnabled)
+            {
+                try
+                {
+                    // the client log is on: switch the server's log on too and learn where it writes
+                    Plugin.Log("Server log: " + RequestHandler.PostJson("/vagabond-openworld/log", "{}"));
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Could not switch the server log on: " + ex.Message);
+                }
+            }
+
             _traderMap = map == null
                 ? new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, List<string>>(map, StringComparer.OrdinalIgnoreCase);

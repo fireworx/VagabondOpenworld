@@ -55,13 +55,23 @@ public class OpenworldRouter(JsonUtil jsonUtil, ProfileHelper profileHelper, SPT
     SPTarkov.Server.Core.Helpers.Quest.QuestHelper questHelper,
     SPTarkov.Server.Core.Helpers.Quest.QuestRewardHelper questRewards,
     SPTarkov.Server.Core.Routers.EventOutputHolder outputs,
+    SPTarkov.Server.Core.Utils.Cloners.ICloner cloner,
     TraderHelper traderHelper,
-    HandbookHelper handbookHelper) : StaticRouter(jsonUtil, [
+    HandbookHelper handbookHelper,
+    SPTarkov.Server.Core.Controllers.HideoutController hideoutController,
+    SPTarkov.Server.Core.Models.Spt.Tables.HideoutTable hideoutTable,
+    IServiceProvider services,
+    SPTarkov.Server.Core.Routers.EventOutputHolder outputHolder) : StaticRouter(jsonUtil, [
     // exfil identifier -> trader ids bound to it (trader_locations.json + other mods' AddTraderLocations)
     new RouteAction(
         "/vagabond-openworld/map",
-        (_, _, _, _, _) =>
+        (_, _, sessionID, _, _) =>
         {
+            if (OpenworldLog.Enabled)
+            {
+                OpenworldLog.Trace("raid start (map requested), " + OpenworldHideout.Snapshot(profileHelper.GetPmcProfile(sessionID)));
+            }
+
             var map = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             foreach (var loc in Api.GetTraderExtractions())
             {
@@ -117,6 +127,103 @@ public class OpenworldRouter(JsonUtil jsonUtil, ProfileHelper profileHelper, SPT
             return ValueTask.FromResult(jsonUtil.Serialize(response) ?? "{}");
         }
     ),
+    new RouteAction(
+        "/vagabond-openworld/fence",
+        (_, _, _, _, _) =>
+        {
+            return ValueTask.FromResult<object>(jsonUtil.Serialize(new { Enabled = OpenworldVagabondConfig.FenceAtHideout() }) ?? "{}");
+        },
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction(
+        "/vagabond-openworld/log",
+        (_, _, _, _, _) =>
+        {
+            OpenworldLog.FromClient = true;
+            OpenworldLog.Trace("log switched on by the client");
+            return ValueTask.FromResult<object>(jsonUtil.Serialize(new { Folder = OpenworldLog.Folder, File = OpenworldLog.FileName }) ?? "{}");
+        },
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction(
+        "/vagabond-openworld/hideout/list",
+        (_, _, sessionID, _, _) =>
+            ValueTask.FromResult<object>(jsonUtil.Serialize(OpenworldHideout.List(sessionID, profileHelper, hideoutTable)) ?? "{}"),
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction<HideoutBuildRequest>(
+        "/vagabond-openworld/hideout/build",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldHideout.Build(sessionID, payload, profileHelper, hideoutTable, hideoutController, outputHolder)) ?? "{}")
+    ),
+    new RouteAction(
+        "/vagabond-openworld/hideout/recipes",
+        (_, _, sessionID, _, _) =>
+            ValueTask.FromResult<object>(jsonUtil.Serialize(OpenworldCraft.List(sessionID, profileHelper, hideoutTable)) ?? "{}"),
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction<CraftRequest>(
+        "/vagabond-openworld/hideout/craft",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldCraft.Craft(sessionID, payload, profileHelper, hideoutTable, hideoutController, outputHolder)) ?? "{}")
+    ),
+    new RouteAction(
+        "/vagabond-openworld/hideout/ready",
+        (_, _, sessionID, _, _) =>
+            ValueTask.FromResult<object>(jsonUtil.Serialize(OpenworldCraft.Ready(sessionID, profileHelper, hideoutTable)) ?? "{}"),
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction<CraftRequest>(
+        "/vagabond-openworld/hideout/collect",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldCraft.Collect(sessionID, payload, profileHelper, hideoutTable, hideoutController, outputHolder, mailSend)) ?? "{}")
+    ),
+    new RouteAction(
+        "/vagabond-openworld/stash/list",
+        (_, _, sessionID, _, _) =>
+            ValueTask.FromResult<object>(jsonUtil.Serialize(OpenworldStash.List(sessionID, profileHelper)) ?? "{}"),
+        typeof(UnlockRequest) // body is ignored
+    ),
+    new RouteAction<StashTakeRequest>(
+        "/vagabond-openworld/stash/take",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldStash.Take(sessionID, payload, profileHelper)) ?? "{}")
+    ),
+    new RouteAction<StashTakeRequest>(
+        "/vagabond-openworld/stash/remove",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldStash.Remove(sessionID, payload, profileHelper)) ?? "{}")
+    ),
+    new RouteAction<RulesRequest>(
+        "/vagabond-openworld/rules",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldRules.Apply(payload, hideoutTable)) ?? "{}")
+    ),
+    new RouteAction<StationRequest>(
+        "/vagabond-openworld/station/info",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldGenerator.Info(sessionID, payload, profileHelper, hideoutTable)) ?? "{}")
+    ),
+    new RouteAction<CraftRequest>(
+        "/vagabond-openworld/station/collect",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldCraft.Collect(sessionID, new CraftRequest { Recipe = string.IsNullOrEmpty(payload.Recipe) ? OpenworldGenerator.BitcoinRecipe : payload.Recipe }, profileHelper, hideoutTable, hideoutController, outputHolder, mailSend)) ?? "{}")
+    ),
+    new RouteAction<GeneratorLoadRequest>(
+        "/vagabond-openworld/generator/load",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldGenerator.Load(sessionID, payload, profileHelper, hideoutTable)) ?? "{}")
+    ),
+    new RouteAction<GeneratorUnloadRequest>(
+        "/vagabond-openworld/generator/unload",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldGenerator.Unload(sessionID, payload, profileHelper, hideoutTable, services, mailSend, outputs.GetOutput(sessionID))) ?? "{}")
+    ),
+    new RouteAction<GeneratorToggleRequest>(
+        "/vagabond-openworld/generator/toggle",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldGenerator.Toggle(sessionID, payload, profileHelper, hideoutTable)) ?? "{}")
+    ),
     new RouteAction<TradeReport>(
         "/vagabond-openworld/trade",
         (_, payload, sessionID, _, _) =>
@@ -127,10 +234,15 @@ public class OpenworldRouter(JsonUtil jsonUtil, ProfileHelper profileHelper, SPT
         (_, payload, sessionID, _, _) =>
             ValueTask.FromResult(jsonUtil.Serialize(OpenworldMail.QuestStarted(sessionID, payload, profileHelper, questHelper, questRewards, outputs, mailSend)) ?? "{}")
     ),
+    new RouteAction<QuestStartRequest>(
+        "/vagabond-openworld/quest/rewards",
+        (_, payload, sessionID, _, _) =>
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldMail.QuestRewards(sessionID, payload, profileHelper, questHelper, cloner)) ?? "{}")
+    ),
     new RouteAction<SendRequest>(
         "/vagabond-openworld/mail/send",
         (_, payload, sessionID, _, _) =>
-            ValueTask.FromResult(jsonUtil.Serialize(OpenworldMail.Send(sessionID, payload, profileHelper, mailSend)) ?? "{}")
+            ValueTask.FromResult(jsonUtil.Serialize(OpenworldMail.Send(sessionID, payload, profileHelper, mailSend, services, outputs)) ?? "{}")
     ),
     new RouteAction<MailRequest>(
         "/vagabond-openworld/mail/list",
@@ -156,6 +268,9 @@ public sealed class SendRequest : IRequestData
 {
     /// <summary>The items and everything in or on them; the top items have no parent.</summary>
     public List<Item> Items { get; set; } = [];
+
+    /// <summary>Set for the trader's delivery service: the items come as this trader's message, never into the stash.</summary>
+    public string? TraderId { get; set; }
 }
 
 public sealed class MoneyAmount
@@ -210,6 +325,8 @@ public sealed class MailListResponse
 {
     public bool Ok { get; set; }
     public List<MailMessage> Messages { get; set; } = [];
+    /// <summary>After sending items: "stash", "mail" or "both".</summary>
+    public string? Where { get; set; }
     public string? Error { get; set; }
 }
 
@@ -327,6 +444,63 @@ public static class OpenworldMail
 
     private static readonly ConcurrentDictionary<string, HashSet<string>> Started = new();
 
+    private static readonly ConcurrentDictionary<string, HashSet<string>> Rewarded = new();
+
+    /// <summary>
+    /// A quest handed in in a raid: the normal payout runs on a throwaway copy of the character. The reward mail it sends is real
+    /// (the items arrive as the trader's message); experience and standing land on the copy and are dropped.
+    /// Adapted from ZeroMenuTime (MIT, r2rka1).
+    /// </summary>
+    public static QuestStartResponse QuestRewards(MongoId sessionId, QuestStartRequest request, ProfileHelper profiles,
+        SPTarkov.Server.Core.Helpers.Quest.QuestHelper quests, SPTarkov.Server.Core.Utils.Cloners.ICloner cloner)
+    {
+        var response = new QuestStartResponse();
+        try
+        {
+            var pmc = profiles.GetPmcProfile(sessionId);
+            if (pmc == null || string.IsNullOrEmpty(request.QuestId))
+            {
+                response.Error = "No profile or no quest";
+                return response;
+            }
+
+            MongoId questId = request.QuestId;
+            if (quests.GetQuestFromDb(questId, pmc) == null)
+            {
+                response.Error = "Unknown quest";
+                return response;
+            }
+
+            var done = Rewarded.GetOrAdd(sessionId.ToString(), _ => []);
+            lock (done)
+            {
+                if (!done.Add(request.QuestId))
+                {
+                    response.Ok = true;
+                    return response;
+                }
+            }
+
+            var copy = cloner.Clone(pmc);
+            quests.CompleteQuest(copy!, new SPTarkov.Server.Core.Models.Eft.Quests.CompleteQuestRequestData
+            {
+                Action = "CompleteQuest",
+                QuestId = questId,
+                RemoveExcessItems = false,
+            }, sessionId);
+            response.Count = 1;
+            response.Ok = true;
+            OpenworldLog.Trace("quest/rewards " + request.QuestId + " paid through the trader's mail");
+        }
+        catch (Exception e)
+        {
+            OpenworldLog.Error("mail", e);
+            response.Error = e.GetType().Name + ": " + e.Message;
+        }
+
+        return response;
+    }
+
     /// <summary>
     /// A quest accepted in a raid only changes its status in the game, so its starting items and its
     /// message never came. They are made here and mailed by the quest's trader, as in the menu.
@@ -381,7 +555,7 @@ public static class OpenworldMail
             response.Count = items.Count(x => x.ParentId == null || !ids.Contains(x.ParentId));
             if (items.Count > 0)
             {
-                var text = quests.GetMessageIdForQuestStart(quest.StartedMessageText, quest.Description);
+                var text = quests.GetMessageIdForQuestStart(quest.StartedMessageText ?? "", quest.Description ?? "");
                 mail.SendLocalisedNpcMessageToPlayer(sessionId, quest.TraderId,
                     SPTarkov.Server.Core.Models.Enums.MessageType.QuestStart, text, items, 7 * 24 * 3600);
             }
@@ -390,6 +564,7 @@ public static class OpenworldMail
         }
         catch (Exception e)
         {
+            OpenworldLog.Error("mail", e);
             response.Error = e.GetType().Name + ": " + e.Message;
         }
 
@@ -398,7 +573,8 @@ public static class OpenworldMail
 
     /// <summary>Delivered by the BTR driver (as the game's own delivery does), kept for a week.</summary>
     public static MailListResponse Send(MongoId sessionId, SendRequest request, ProfileHelper profiles,
-        SPTarkov.Server.Core.Services.Commerce.MailSendService mail)
+        SPTarkov.Server.Core.Services.Commerce.MailSendService mail, IServiceProvider services,
+        SPTarkov.Server.Core.Routers.EventOutputHolder outputs)
     {
         var response = new MailListResponse();
         try
@@ -409,13 +585,39 @@ public static class OpenworldMail
                 return response;
             }
 
-            mail.SendDirectNpcMessageToPlayer(sessionId, BtrDriver,
-                SPTarkov.Server.Core.Models.Enums.MessageType.MessageWithItems,
-                "Your items from the raid.", request.Items, 7 * 24 * 3600);
-            response.Ok = true;
+            if (!string.IsNullOrEmpty(request.TraderId))
+            {
+                // every item gets a fresh id (the carried originals may still be in the profile)
+                var fresh = request.Items.ToDictionary(x => x.Id.ToString(), _ => new MongoId().ToString());
+                var parcel = request.Items.Select(x =>
+                {
+                    var isRoot = x.ParentId == null || !fresh.ContainsKey(x.ParentId);
+                    return x with
+                    {
+                        Id = new MongoId(fresh[x.Id.ToString()]),
+                        ParentId = isRoot ? null : fresh[x.ParentId!],
+                        SlotId = isRoot ? null : x.SlotId,
+                        Location = isRoot ? null : x.Location
+                    };
+                }).ToList();
+                mail.SendDirectNpcMessageToPlayer(sessionId, request.TraderId,
+                    SPTarkov.Server.Core.Models.Enums.MessageType.MessageWithItems,
+                    "Your delivery from the raid.", parcel, 30 * 24 * 3600);
+                response.Where = "mail";
+                response.Ok = true;
+                return response;
+            }
+
+            response.Where = OpenworldStash.Put(sessionId, profiles.GetPmcProfile(sessionId)!, request.Items, services, mail, outputs.GetOutput(sessionId));
+            response.Ok = response.Where != "none";
+            if (!response.Ok)
+            {
+                response.Error = "Nothing was stored";
+            }
         }
         catch (Exception e)
         {
+            OpenworldLog.Error("mail", e);
             response.Error = e.GetType().Name + ": " + e.Message;
         }
 
@@ -451,6 +653,7 @@ public static class OpenworldMail
         }
         catch (Exception e)
         {
+            OpenworldLog.Error("mail", e);
             response.Error = e.Message;
         }
 
@@ -496,9 +699,64 @@ public static class OpenworldMail
         }
         catch (Exception e)
         {
+            OpenworldLog.Error("mail", e);
             response.Error = e.Message;
         }
 
         return response;
+    }
+}
+
+
+/// <summary>
+/// Reads Vagabond's own setting "AddFenceToHideout" (Fence is a trader of the hideout) without changing anything of Vagabond.
+/// Its configuration class is found by name in the loaded assemblies, because its assembly is not referenced here.
+/// </summary>
+public static class OpenworldVagabondConfig
+{
+    private static bool? _cached;
+
+    public static bool FenceAtHideout()
+    {
+        if (_cached != null)
+        {
+            return _cached.Value;
+        }
+
+        try
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type[] types;
+                try
+                {
+                    types = assembly.GetTypes();
+                }
+                catch (System.Reflection.ReflectionTypeLoadException e)
+                {
+                    types = e.Types.Where(t => t != null).ToArray()!;
+                }
+
+                foreach (var type in types.Where(t => t.Name == "VagabondConfig"))
+                {
+                    var holder = type.GetProperty("Config", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.GetValue(null)
+                        ?? type.GetField("Config", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.GetValue(null);
+                    var value = holder?.GetType().GetProperty("AddFenceToHideout")?.GetValue(holder);
+                    if (value is bool flag)
+                    {
+                        OpenworldLog.Trace("Vagabond setting AddFenceToHideout = " + flag + " (read from " + type.FullName + ")");
+                        return (_cached = flag).Value;
+                    }
+                }
+            }
+
+            OpenworldLog.Trace("Vagabond setting AddFenceToHideout not found");
+        }
+        catch (Exception e)
+        {
+            OpenworldLog.Error("vagabond config", e);
+        }
+
+        return false;
     }
 }

@@ -263,6 +263,41 @@ namespace OpenworldAddon
 
         public static async Task<bool> Give(Player player, Item item)
         {
+            // A stack above its maximum (400 rounds of ammo, say) is not a valid item in the raid: split it into proper stacks.
+            if (item.StackMaxSize > 1 && item.StackObjectsCount > item.StackMaxSize && item.GetAllItems().Count() == 1)
+            {
+                var total = item.StackObjectsCount;
+                var max = item.StackMaxSize;
+                var chunks = new List<Item>();
+                for (var left = total; left > 0; left -= max)
+                {
+                    var part = chunks.Count == 0 ? item : item.CloneItem(player.InventoryController);
+                    part.StackObjectsCount = Math.Min(max, left);
+                    part.UnlimitedCount = false;
+                    chunks.Add(part);
+                }
+
+                var placed = new List<Item>();
+                foreach (var part in chunks)
+                {
+                    if (await Give(player, part))
+                    {
+                        placed.Add(part);
+                        continue;
+                    }
+
+                    foreach (var done in placed)
+                    {
+                        await Take(player, done, done.StackObjectsCount);
+                    }
+
+                    item.StackObjectsCount = total;
+                    return false;
+                }
+
+                return true;
+            }
+
             var controller = player.InventoryController;
 
             // The raid only has models loaded for items that were in it at the start. A new item needs
@@ -282,7 +317,9 @@ namespace OpenworldAddon
             if (item.StackMaxSize > 1)
             {
                 var stacks = CarriedItems(player)
-                    .Where(x => x.TemplateId == item.TemplateId && x.StackObjectsCount < x.StackMaxSize)
+                    .Where(x => x.TemplateId == item.TemplateId && x.StackObjectsCount < x.StackMaxSize
+                        // only loose stacks in a grid: rounds inside a magazine are not a place to put things into
+                        && (x.Parent?.Container?.GetType().Name ?? "").IndexOf("Grid", StringComparison.OrdinalIgnoreCase) >= 0)
                     .ToList();
                 int capacity = stacks.Sum(x => x.StackMaxSize - x.StackObjectsCount);
                 if (capacity < item.StackObjectsCount && address == null)

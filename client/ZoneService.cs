@@ -44,7 +44,7 @@ public static class ZoneService
     private static ZoneKind _currentKind;
     private static List<string> _currentTraderIds;
 
-    // set while we deliberately let the vanilla extraction start ("Leave to hideout")
+    // set while we deliberately let the vanilla extraction start ("Exit and save")
     private static ExfiltrationPoint _allowExtractPoint;
 
     // the interaction object we put into the owner's AvailableInteractionState
@@ -72,28 +72,13 @@ public static class ZoneService
             return false;
         }
 
-        // the player picked "Leave to hideout": let the vanilla extraction start
+        // the player picked "Exit and save": let the vanilla extraction start
         if (ReferenceEquals(_allowExtractPoint, point))
         {
             return false;
         }
 
-        var kind = ZoneKind.None;
-        List<string> traderIds = null;
-
-        if (Plugin.TraderZoneEnabled &&
-            ZoneLookup.TryGetTraderExfil(point.Settings, out traderIds))
-        {
-            kind = ZoneKind.Trader;
-        }
-        else if (Plugin.HideoutZoneEnabled &&
-                 ZoneLookup.TryGetCustomExfil(point.Settings, out var definition) &&
-                 definition.Identifier != null &&
-                 definition.Identifier.StartsWith(HideoutIdPrefix, StringComparison.OrdinalIgnoreCase))
-        {
-            kind = ZoneKind.Hideout;
-        }
-
+        Classify(point, out var kind, out var traderIds);
         if (kind == ZoneKind.None)
         {
             return false;
@@ -116,6 +101,22 @@ public static class ZoneService
         _nextPromptRefresh = 0f;
         ApplyPrompt(force: true);
         return true;
+    }
+
+    private static void Classify(ExfiltrationPoint point, out ZoneKind kind, out List<string> traderIds)
+    {
+        kind = ZoneKind.None;
+        traderIds = null;
+        if (Plugin.TraderZoneEnabled && ZoneLookup.TryGetTraderExfil(point.Settings, out traderIds))
+        {
+            kind = ZoneKind.Trader;
+        }
+        else if (Plugin.HideoutZoneEnabled && ZoneLookup.TryGetCustomExfil(point.Settings, out var definition) &&
+                 definition.Identifier != null &&
+                 definition.Identifier.StartsWith(HideoutIdPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            kind = ZoneKind.Hideout;
+        }
     }
 
     public static void Exit(ExfiltrationPoint point, Collider collider)
@@ -181,6 +182,100 @@ public static class ZoneService
         ApplyPrompt(force: false);
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Moves the game's interaction prompt lower on the screen while a zone prompt is shown.
+    // ------------------------------------------------------------------------------------------
+    private static RectTransform _promptRect;
+    private static Vector2 _promptBase, _promptWritten;
+    private static bool _promptMoved;
+    private static float _nextPromptSearch;
+    private static bool _promptCandidatesLogged;
+
+    private static RectTransform FindPromptRect()
+    {
+        RectTransform found = null;
+        var seen = new List<string>();
+        foreach (var behaviour in Resources.FindObjectsOfTypeAll<MonoBehaviour>())
+        {
+            if (behaviour == null || !behaviour.gameObject.activeInHierarchy)
+            {
+                continue;
+            }
+
+            var type = behaviour.GetType().Name;
+            if (type.IndexOf("Interact", StringComparison.OrdinalIgnoreCase) < 0 && type.IndexOf("ActionPanel", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                continue;
+            }
+
+            seen.Add(type + " on " + behaviour.gameObject.name);
+            if (found == null && (type == "InteractionButtonsContainer" || type == "ActionPanel" || type == "InteractionPanel"))
+            {
+                found = behaviour.transform as RectTransform;
+            }
+        }
+
+        if (!_promptCandidatesLogged)
+        {
+            _promptCandidatesLogged = true;
+            Plugin.Trace("Prompt candidates: " + (seen.Count == 0 ? "none" : string.Join("; ", seen.ToArray())) + " -> " + (found == null ? "not found" : found.name));
+        }
+
+        return found;
+    }
+
+    private static void LowerPrompt()
+    {
+        var offset = Plugin.PromptOffset;
+        var active = _promptValue != null && _currentKind != ZoneKind.None && offset != 0f;
+        if (_promptRect != null && (!active || !_promptRect.gameObject.activeInHierarchy))
+        {
+            if (_promptMoved)
+            {
+                _promptRect.anchoredPosition = _promptBase; // back to where the game keeps it
+            }
+
+            _promptMoved = false;
+            if (!_promptRect.gameObject.activeInHierarchy)
+            {
+                _promptRect = null; // gone: searched again next time; while it only is inactive it is kept (the search is expensive)
+            }
+
+            return;
+        }
+
+        if (!active)
+        {
+            return;
+        }
+
+        if (_promptRect == null)
+        {
+            if (Time.unscaledTime < _nextPromptSearch)
+            {
+                return;
+            }
+
+            _nextPromptSearch = Time.unscaledTime + 3f;
+            _promptRect = FindPromptRect();
+            _promptMoved = false;
+            if (_promptRect == null)
+            {
+                return;
+            }
+        }
+
+        var current = _promptRect.anchoredPosition;
+        if (!_promptMoved || (current - _promptWritten).sqrMagnitude > 0.01f)
+        {
+            _promptBase = current; // the game moved it (or we have not touched it yet)
+        }
+
+        _promptWritten = _promptBase + new Vector2(0f, -offset);
+        _promptRect.anchoredPosition = _promptWritten;
+        _promptMoved = true;
+    }
+
     private static void Leave()
     {
         ClearPrompt();
@@ -197,19 +292,38 @@ public static class ZoneService
     // "Read messages": opens the messages window.
     private static async void ShowMessages()
     {
-        var entries = await Mail.Fetch();
-        if (entries == null)
+        var groups = await BuildMessageGroups();
+        if (groups == null)
         {
             return;
         }
 
-        if (entries.Count == 0)
+        if (groups.Count <= 1)
         {
             NotificationGate.Message("No items are waiting in your messages.");
             return;
         }
 
+        MessagesPanel.Open("MESSAGES", "FROM", "TAKE", groups, BuildMessageGroups);
+    }
+
+    private static async System.Threading.Tasks.Task<List<MessagesPanel.Group>> BuildMessageGroups()
+    {
+        var entries = await Mail.Fetch();
+        if (entries == null)
+        {
+            return null;
+        }
+
         var groups = new List<MessagesPanel.Group>();
+        var target = new MessagesPanel.Group { Name = "Take items to", Key = "0" };
+        target.Rows.Add(new MessagesPanel.Row
+        {
+            Label = "Taken items go to: " + (Mail.ToInventory ? "your INVENTORY" : "your STASH"),
+            Verb = "SWITCH", NoBulk = true,
+            Act = () => { Mail.ToInventory = !Mail.ToInventory; return System.Threading.Tasks.Task.FromResult(true); }
+        });
+        groups.Add(target);
         foreach (var msg in entries)
         {
             var group = groups.FirstOrDefault(g => g.Name == msg.Sender);
@@ -232,7 +346,7 @@ public static class ZoneService
             }
         }
 
-        MessagesPanel.Open("MESSAGES", "FROM", "TAKE", groups);
+        return groups;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -266,6 +380,8 @@ public static class ZoneService
         public Canvas Canvas;
         public bool Override;
         public int Order;
+        /// <summary>The sorting order it gets while the trader screen is open (500; the game's windows get more).</summary>
+        public int Level = 500;
     }
 
     private static readonly List<RaisedCanvas> _raised = new List<RaisedCanvas>();
@@ -298,6 +414,24 @@ public static class ZoneService
                         _raised.Add(new RaisedCanvas { Canvas = canvas, Override = canvas.overrideSorting, Order = canvas.sortingOrder });
                     }
 
+                    // the game's own dialogs (confirmations, hand-in windows) sit in the canvas of the item UI: above the screen
+                    var windows = EFT.UI.ItemUiContext.Instance;
+                    if (windows != null)
+                    {
+                        foreach (var canvas in windows.GetComponentsInParent<Canvas>(true))
+                        {
+                            var known = _raised.FirstOrDefault(r => r.Canvas == canvas);
+                            if (known != null)
+                            {
+                                known.Level = 600;
+                            }
+                            else
+                            {
+                                _raised.Add(new RaisedCanvas { Canvas = canvas, Override = canvas.overrideSorting, Order = canvas.sortingOrder, Level = 600 });
+                            }
+                        }
+                    }
+
                     _menuRaised = true;
                     Plugin.Log("Trader screen: raising " + string.Join(", ", _raised.Select(r =>
                         r.Canvas.name + " (order " + r.Order + ", " + r.Canvas.renderMode + ", override " + r.Override + ")").ToArray()));
@@ -308,7 +442,7 @@ public static class ZoneService
                     if (raised.Canvas != null)
                     {
                         raised.Canvas.overrideSorting = true;
-                        raised.Canvas.sortingOrder = 500;
+                        raised.Canvas.sortingOrder = raised.Level;
                     }
                 }
 
@@ -368,6 +502,7 @@ public static class ZoneService
     {
         StatsGuard.Tick();
         MessagesPanel.LateTick();
+        LowerPrompt();
 
         if (!_traderScreenOpen)
         {
@@ -877,7 +1012,7 @@ public static class ZoneService
 
                 var it = item;
                 var label = it.ShortName.Localized() + (it.StackObjectsCount > 1 ? " x" + it.StackObjectsCount : "");
-                group.Rows.Add(new MessagesPanel.Row { Item = it, Label = label, Act = () => Mail.Send(it, label) });
+                group.Rows.Add(new MessagesPanel.Row { Item = it, Label = label + ItemFill.Text(it), Act = () => Mail.Send(it, label) });
             }
 
             MessagesPanel.Open("SEND TO HIDEOUT", "CARRIED IN", "SEND", groups);
@@ -886,6 +1021,137 @@ public static class ZoneService
         {
             Plugin.LogError("Send items to hideout failed: " + ex);
             NotificationGate.Warn("Could not list your items.");
+        }
+    }
+
+    private static object Member(object target, string name)
+    {
+        var type = target.GetType();
+        var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (property != null)
+        {
+            return property.GetValue(property.GetIndexParameters().Length == 0 ? target : null, null);
+        }
+
+        return type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(target);
+    }
+
+    private static bool SetNumber(object target, string name, float value)
+    {
+        var type = target.GetType();
+        var property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (property != null && property.CanWrite)
+        {
+            property.SetValue(target, Convert.ChangeType(value, property.PropertyType), null);
+            return true;
+        }
+
+        var field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (field != null)
+        {
+            field.SetValue(target, Convert.ChangeType(value, field.FieldType));
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>The configured countdown for leaving through the hideout exfil.</summary>
+    private static void ApplyExtractionTime(ExfiltrationPoint point)
+    {
+        try
+        {
+            var settings = Member(point, "Settings");
+            if (settings == null)
+            {
+                return;
+            }
+
+            var seconds = Plugin.ExtractionTime;
+            var before = Member(settings, "ExfiltrationTime");
+            var ok = SetNumber(settings, "ExfiltrationTime", seconds);
+            SetNumber(settings, "ExfiltrationTimePVE", seconds);
+            Plugin.Trace("Extraction time: " + before + " -> " + seconds + (ok ? "" : " (could not be set)"));
+        }
+        catch (Exception ex)
+        {
+            Plugin.LogError("Could not set the extraction time: " + ex.Message);
+        }
+    }
+
+    /// <summary>True when the exit point lists the player among those who stand in it (a collection of players on the point).</summary>
+    private static bool? PlayerRegistered(ExfiltrationPoint point, Player player)
+    {
+        bool? known = null;
+        foreach (var member in point.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+        {
+            var type = member.FieldType;
+            if (!type.IsGenericType || !typeof(IEnumerable).IsAssignableFrom(type) ||
+                !type.GetGenericArguments().Any(t => typeof(Player).IsAssignableFrom(t)))
+            {
+                continue;
+            }
+
+            known = false;
+            if (member.GetValue(point) is IEnumerable list && list.Cast<object>().Any(x => ReferenceEquals(x, player)))
+            {
+                return true;
+            }
+        }
+
+        return known;
+    }
+
+    private static bool InvokeEnter(ExfiltrationPoint point, Collider collider)
+    {
+        var method = typeof(ExfiltrationPoint).GetMethod(
+            "IPhysicsTrigger.OnTriggerEnter",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        if (method == null)
+        {
+            Plugin.LogError("Could not find ExfiltrationPoint.IPhysicsTrigger.OnTriggerEnter.");
+            return false;
+        }
+
+        _allowExtractPoint = point;
+        try
+        {
+            // goes through our prefix, which lets it pass because of _allowExtractPoint
+            method.Invoke(point, new object[] { collider });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Plugin.LogError($"Failed to start the extraction at the hideout exfil: {ex}");
+            return false;
+        }
+        finally
+        {
+            _allowExtractPoint = null;
+        }
+    }
+
+    /// <summary>The first try is sometimes ignored by the exit point (Vagabond has not released it yet): try again while the player is not registered.</summary>
+    private static IEnumerator RetryLeave(ExfiltrationPoint point, Collider collider, Player player)
+    {
+        for (var attempt = 1; attempt <= 6; attempt++)
+        {
+            yield return new WaitForSeconds(attempt == 1 ? 0.4f : 1.2f);
+            if (point == null || collider == null || player == null || !Plugin.IsInRaid())
+            {
+                yield break;
+            }
+
+            var registered = PlayerRegistered(point, player);
+            Plugin.Trace("Leave raid check " + attempt + ": status=" + Member(point, "Status") + ", registered=" + (registered.HasValue ? registered.ToString() : "unknown"));
+            if (registered != false)
+            {
+                yield break; // started, or not detectable: do not trigger it twice
+            }
+
+            Plugin.Log("Leave raid: the exit did not start, trying again.");
+            ApplyExtractionTime(point);
+            InvokeEnter(point, collider);
         }
     }
 
@@ -898,34 +1164,28 @@ public static class ZoneService
             return;
         }
 
-        var method = typeof(ExfiltrationPoint).GetMethod(
-            "IPhysicsTrigger.OnTriggerEnter",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-        if (method == null)
+        ClearPrompt();
+        ApplyExtractionTime(point);
+        Plugin.Trace("Leave raid: status=" + Member(point, "Status"));
+        var started = InvokeEnter(point, collider);
+        if (started)
         {
-            Plugin.LogError("Could not find ExfiltrationPoint.IPhysicsTrigger.OnTriggerEnter.");
+            Plugin.Log("Leave raid: extraction trigger invoked.");
+            var player = Singleton<GameWorld>.Instance?.MainPlayer;
+            if (player != null && Plugin.Instance != null)
+            {
+                Plugin.Instance.StartCoroutine(RetryLeave(point, collider, player));
+            }
+        }
+        else
+        {
             NotificationGate.Warn("Could not start the extraction.");
-            return;
         }
 
-        ClearPrompt();
-        _allowExtractPoint = point;
-        try
-        {
-            // goes through our prefix, which lets it pass because of _allowExtractPoint
-            method.Invoke(point, new object[] { collider });
-            Plugin.Log("Leave raid: extraction trigger invoked.");
-        }
-        catch (Exception ex)
-        {
-            Plugin.LogError($"Failed to start the extraction at the hideout exfil: {ex}");
-        }
-        finally
-        {
-            _allowExtractPoint = null;
-            Leave();
-        }
+        Leave();
     }
+
+    private const string FenceId = "579dc571d53a0658a154fbec";
 
     private static string TraderName(string traderId)
     {
@@ -1110,11 +1370,20 @@ public static class ZoneService
 
         if (_currentKind == ZoneKind.Hideout)
         {
+            if (ZoneLookup.FenceAtHideout)
+            {
+                AddAction("Open " + TraderName(FenceId), () => OpenTrader(FenceId));
+            }
+
+            AddAction("Build hideout", HideoutBuild.Open);
+            AddAction("Craft", HideoutCraft.Open);
+            AddAction("Open stash", StashWindow.Open);
+            AddAction("Stations", StationsWindow.Open);
             AddAction("Send items to hideout", SendItemsToHideout);
             AddAction("Read messages", ShowMessages);
             var leavePoint = _currentPoint;
             var leaveCollider = _currentCollider;
-            AddAction("Leave to hideout", () => LeaveRaid(leavePoint, leaveCollider));
+            AddAction("Exit and save", () => LeaveRaid(leavePoint, leaveCollider));
         }
         else if (_currentTraderIds != null)
         {
@@ -1122,6 +1391,26 @@ public static class ZoneService
             {
                 var id = traderId;
                 AddAction($"Open {TraderName(id)}", () => OpenTrader(id));
+            }
+
+            if (Plugin.FastTravelEnabled)
+            {
+                AddAction("Fast travel", FastTravel.Open);
+            }
+
+            if (Plugin.DeliveryEnabled)
+            {
+                var deliveryTrader = _currentTraderIds.FirstOrDefault();
+                AddAction("Delivery service", () => Delivery.Open(deliveryTrader));
+            }
+
+            if (Plugin.HideoutAtTradersEnabled)
+            {
+                AddAction("Build hideout", HideoutBuild.Open);
+                AddAction("Craft", HideoutCraft.Open);
+                    AddAction("Open stash", StashWindow.Open);
+            AddAction("Stations", StationsWindow.Open);
+                AddAction("Send items to hideout", SendItemsToHideout);
             }
 
             AddAction("Read messages", ShowMessages);

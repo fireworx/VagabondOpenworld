@@ -22,6 +22,9 @@ public static class MessagesPanel
 {
     private const string CanvasName = "Openworld messages panel";
 
+    /// <summary>All text of the window is drawn at this share of its design size.</summary>
+    private const float TextScale = 0.75f;
+
     private static readonly Color Ink = new Color32(231, 229, 212, 255);
     private static readonly Color Dim = new Color32(231, 229, 212, 140);
     private static readonly Color Gold = new Color32(197, 160, 72, 255);
@@ -32,31 +35,78 @@ public static class MessagesPanel
         public EFT.InventoryLogic.Item Item;
         public string Label;
         public string Note;
+        /// <summary>Button text of this line; the window's verb when empty.</summary>
+        public string Verb;
+        /// <summary>True keeps the line out of the "all" button (an unload next to loads, say).</summary>
+        public bool NoBulk;
         public Func<System.Threading.Tasks.Task<bool>> Act;
+        /// <summary>False draws the line in red (a missing requirement). A line with no Act has no button.</summary>
+        public bool Good = true;
     }
 
     /// <summary>One entry of the left column and the rows it holds.</summary>
     public sealed class Group
     {
         public string Name;
+        /// <summary>Stays the same when the name changes (a station's level); the name is used when null.</summary>
+        public string Key;
         public List<Row> Rows = new List<Row>();
+        /// <summary>A button over the rows (BUILD).</summary>
+        public Func<System.Threading.Tasks.Task<bool>> Action;
+        public string ActionLabel;
+        public bool ActionEnabled = true;
+        /// <summary>A colour for its entry in the left column (e.g. green: can be built).</summary>
+        public Color? Tint;
+
+        public string Id => Key ?? Name;
     }
 
     private static GameObject _canvas;
     private static List<Group> _groups;
     private static string _selected, _title, _verb, _side;
+    private static Func<System.Threading.Tasks.Task<List<Group>>> _reload;
     private static bool _busy;
     private static TMP_FontAsset _font;
+    private static string _filter = "";
+    private static bool _refocus;
+
+    private static bool Match(Row row)
+    {
+        return string.IsNullOrEmpty(_filter)
+               || (row.Label ?? "").IndexOf(_filter, StringComparison.OrdinalIgnoreCase) >= 0
+               || (row.Note ?? "").IndexOf(_filter, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool Shown(Group group)
+    {
+        return string.IsNullOrEmpty(_filter)
+               || (group.Name ?? "").IndexOf(_filter, StringComparison.OrdinalIgnoreCase) >= 0
+               || group.Rows.Any(Match);
+    }
+
+    /// <summary>The rows of a group that the text filter lets through (all of them if the group's name matches).</summary>
+    private static IEnumerable<Row> Visible(Group group)
+    {
+        var nameMatches = !string.IsNullOrEmpty(_filter) && (group.Name ?? "").IndexOf(_filter, StringComparison.OrdinalIgnoreCase) >= 0;
+        return nameMatches ? group.Rows : group.Rows.Where(Match);
+    }
+
+    private static bool _all = true;
 
     public static bool IsOpen => _canvas != null;
 
-    public static void Open(string title, string side, string verb, List<Group> groups)
+    public static void Open(string title, string side, string verb, List<Group> groups,
+        Func<System.Threading.Tasks.Task<List<Group>>> reload = null, bool all = true)
     {
+        _reload = reload;
+        _all = all;
         _title = title;
         _side = side;
         _verb = verb;
         _groups = groups;
-        _selected = groups.Select(g => g.Name).FirstOrDefault();
+        _filter = "";
+        _refocus = false;
+        _selected = groups.Select(g => g.Id).FirstOrDefault();
         _busy = false;
         Build();
         GamePlayerOwner.SetIgnoreInputInNPCDialog(true);
@@ -74,6 +124,7 @@ public static class MessagesPanel
         }
 
         _groups = null;
+        _reload = null;
     }
 
     private static void Listen(bool on)
@@ -124,9 +175,25 @@ public static class MessagesPanel
         }
         finally
         {
-            _busy = false;
-            Cleanup();
-            Build();
+            await Finish();
+        }
+    }
+
+    private static async void DoGroupAction(Group group)
+    {
+        if (_busy || group.Action == null)
+        {
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            await group.Action();
+        }
+        finally
+        {
+            await Finish();
         }
     }
 
@@ -140,8 +207,8 @@ public static class MessagesPanel
         _busy = true;
         try
         {
-            var group = _groups.FirstOrDefault(g => g.Name == _selected);
-            foreach (var row in group?.Rows.ToArray() ?? new Row[0])
+            var group = _groups.FirstOrDefault(g => g.Id == _selected);
+            foreach (var row in group == null ? new Row[0] : Visible(group).Where(r => r.Act != null && !r.NoBulk).ToArray())
             {
                 if (!await row.Act())
                 {
@@ -153,10 +220,31 @@ public static class MessagesPanel
         }
         finally
         {
-            _busy = false;
-            Cleanup();
-            Build();
+            await Finish();
         }
+    }
+
+    private static async System.Threading.Tasks.Task Finish()
+    {
+        try
+        {
+            if (_reload != null)
+            {
+                var fresh = await _reload();
+                if (fresh != null)
+                {
+                    _groups = fresh;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Plugin.LogError("Messages panel: reload failed: " + e.Message);
+        }
+
+        _busy = false;
+        Cleanup();
+        Build();
     }
 
     private static void Cleanup()
@@ -166,10 +254,14 @@ public static class MessagesPanel
             return;
         }
 
-        _groups.RemoveAll(g => g.Rows.Count == 0);
-        if (_selected == null || !_groups.Any(g => g.Name == _selected))
+        if (_reload == null)
         {
-            _selected = _groups.Select(g => g.Name).FirstOrDefault();
+            _groups.RemoveAll(g => g.Rows.Count == 0);
+        }
+
+        if (_selected == null || !_groups.Any(g => g.Id == _selected))
+        {
+            _selected = _groups.Select(g => g.Id).FirstOrDefault();
         }
     }
 
@@ -183,12 +275,14 @@ public static class MessagesPanel
         }
 
         var scrollPos = 1f;
+        var leftPos = 1f;
         if (_canvas != null)
         {
-            var old = _canvas.GetComponentsInChildren<ScrollRect>().LastOrDefault();
-            if (old != null)
+            var olds = _canvas.GetComponentsInChildren<ScrollRect>();
+            if (olds.Length > 0)
             {
-                scrollPos = old.verticalNormalizedPosition;
+                leftPos = olds[0].verticalNormalizedPosition;
+                scrollPos = olds[olds.Length - 1].verticalNormalizedPosition;
             }
 
             UnityEngine.Object.Destroy(_canvas);
@@ -233,6 +327,7 @@ public static class MessagesPanel
         var title = Text(head, _title, 40f, Ink, true);
         title.characterSpacing = 4f;
         Flexible(title.gameObject, 1f, 0f);
+        Filter(head, 320f);
         Button(head, "CLOSE  [ESC]", Close, true, 190f, false);
 
         var body = Node(column, "body");
@@ -244,64 +339,105 @@ public static class MessagesPanel
         Vertical(left, 8f, new RectOffset(0, 0, 0, 0));
         Fixed(left.gameObject, 330f);
         Heading(left, _side);
-        foreach (var group in _groups)
-        {
-            var name = group.Name;
-            Button(left, name.ToUpperInvariant() + "  " + group.Rows.Count, () =>
-            {
-                _selected = name;
-                Build();
-            }, true, 330f, name == _selected);
-        }
+        _leftList = Scroll(left);
 
         // right: what they hold
         var right = Node(body, "right");
         Vertical(right, 10f, new RectOffset(0, 0, 0, 0));
         Flexible(right.gameObject, 1f, 1f);
+        _top = Node(right, "top");
+        Horizontal(_top, 12f);
+        _content = Scroll(right);
+        Fill();
 
-        var mine = _groups.FirstOrDefault(g => g.Name == _selected);
-        var top = Node(right, "top");
-        Horizontal(top, 12f);
-        var heading = Text(top, (_selected ?? "").ToUpperInvariant(), 22f, Gold, true);
-        heading.characterSpacing = 5f;
-        Flexible(heading.gameObject, 1f, 0f);
-        if (mine != null && mine.Rows.Count > 1)
+        var scrolls = _canvas.GetComponentsInChildren<ScrollRect>();
+        if (scrolls.Length > 0)
         {
-            Button(top, _verb + " ALL", DoAll, !_busy, 220f, false);
+            Canvas.ForceUpdateCanvases();
+            scrolls[0].verticalNormalizedPosition = Mathf.Clamp01(leftPos);
+            scrolls[scrolls.Length - 1].verticalNormalizedPosition = Mathf.Clamp01(scrollPos);
+        }
+    }
+
+    private static RectTransform _leftList, _top, _content;
+
+    private static void Clear(RectTransform rect)
+    {
+        for (var i = rect.childCount - 1; i >= 0; i--)
+        {
+            var child = rect.GetChild(i);
+            child.SetParent(null, false);
+            UnityEngine.Object.Destroy(child.gameObject);
+        }
+    }
+
+    /// <summary>Fills the two lists. Typing in the filter only refills them, so the text box keeps its focus.</summary>
+    private static void Fill()
+    {
+        if (_groups == null || _leftList == null)
+        {
+            return;
         }
 
-        var content = Scroll(right);
+        Clear(_leftList);
+        Clear(_top);
+        Clear(_content);
+
+        if (!_groups.Any(g => g.Id == _selected && Shown(g)))
+        {
+            _selected = _groups.Where(Shown).Select(g => g.Id).FirstOrDefault() ?? _selected;
+        }
+
+        foreach (var group in _groups.Where(Shown))
+        {
+            var key = group.Id;
+            Button(_leftList, group.Name.ToUpperInvariant() + (_reload == null ? "  " + Visible(group).Count() : ""), () =>
+            {
+                _selected = key;
+                Build();
+            }, true, 316f, key == _selected, group.Tint);
+        }
+
+        var mine = _groups.FirstOrDefault(g => g.Id == _selected && Shown(g));
+        var heading = Text(_top, (mine?.Name ?? "").ToUpperInvariant(), 22f, Gold, true);
+        heading.characterSpacing = 5f;
+        Flexible(heading.gameObject, 1f, 0f);
+        if (mine != null && mine.Action != null)
+        {
+            var g = mine;
+            Button(_top, g.ActionLabel, () => DoGroupAction(g), g.ActionEnabled && !_busy, 220f, false);
+        }
+        else if (_all && mine != null && Visible(mine).Count(r => r.Act != null && !r.NoBulk) > 1)
+        {
+            Button(_top, _verb + " ALL", DoAll, !_busy, 220f, false);
+        }
+
         string lastNote = null;
         if (mine != null)
         {
-            foreach (var row in mine.Rows)
+            foreach (var row in Visible(mine))
             {
                 if (!string.IsNullOrWhiteSpace(row.Note) && row.Note != lastNote)
                 {
-                    Text(content, row.Note, 15f, Dim, false).fontStyle = FontStyles.Italic;
+                    Text(_content, row.Note, 15f, Dim, false).fontStyle = FontStyles.Italic;
                 }
 
                 lastNote = row.Note;
                 var g = mine;
                 var r = row;
-                var line = Node(content, "row");
+                var line = Node(_content, "row");
                 Horizontal(line, 14f);
                 Icon(line, r.Item, 56f);
-                Flexible(Text(line, r.Label, 20f, Ink, false).gameObject, 1f, 0f);
-                Button(line, _verb, () => Do(g, r), !_busy, 130f, false);
+                Flexible(Text(line, r.Label, 20f, r.Good ? Ink : new Color32(229, 115, 115, 255), false).gameObject, 1f, 0f);
+                if (r.Act != null)
+                {
+                    Button(line, string.IsNullOrEmpty(r.Verb) ? _verb : r.Verb, () => Do(g, r), !_busy, 130f, false);
+                }
             }
         }
-
-        var scroll = _canvas.GetComponentsInChildren<ScrollRect>().LastOrDefault();
-        if (scroll != null)
+        else
         {
-            Canvas.ForceUpdateCanvases();
-            scroll.verticalNormalizedPosition = Mathf.Clamp01(scrollPos);
-        }
-
-        if (mine == null)
-        {
-            Text(content, "Nothing here.", 20f, Dim, false);
+            Text(_content, "Nothing here.", 20f, Dim, false);
         }
     }
 
@@ -392,7 +528,7 @@ public static class MessagesPanel
         }
 
         label.text = words;
-        label.fontSize = size;
+        label.fontSize = size * TextScale;
         label.color = colour;
         label.fontStyle = bold ? FontStyles.Bold : FontStyles.Normal;
         label.alignment = TextAlignmentOptions.MidlineLeft;
@@ -429,6 +565,11 @@ public static class MessagesPanel
         image.preserveAspect = true;
         image.raycastTarget = false;
         image.enabled = false;
+        if (item == null)
+        {
+            return;
+        }
+
         try
         {
             var view = picture.gameObject.AddComponent<MessagesIcon>();
@@ -438,6 +579,48 @@ public static class MessagesPanel
         catch (Exception e)
         {
             Plugin.LogError("Messages panel: no picture for " + item.TemplateId + ": " + e.Message);
+        }
+    }
+
+    /// <summary>A text box that filters the lists while you type.</summary>
+    private static void Filter(RectTransform parent, float width)
+    {
+        var holder = Node(parent, "filter");
+        var back = holder.gameObject.AddComponent<Image>();
+        back.color = new Color32(231, 229, 212, 28);
+        var element = holder.gameObject.AddComponent<LayoutElement>();
+        element.preferredWidth = element.minWidth = width;
+        element.preferredHeight = element.minHeight = 42f;
+        element.flexibleWidth = 0f;
+        var viewport = Node(holder, "viewport");
+        Stretch(viewport);
+        viewport.offsetMin = new Vector2(12f, 4f);
+        viewport.offsetMax = new Vector2(-12f, -4f);
+        viewport.gameObject.AddComponent<RectMask2D>();
+        var text = Text(viewport, "", 18f, Ink, false);
+        Stretch(text.rectTransform);
+        text.enableWordWrapping = false;
+        var hint = Text(viewport, "FILTER...", 18f, Dim, false);
+        Stretch(hint.rectTransform);
+        hint.enableWordWrapping = false;
+        hint.fontStyle = FontStyles.Italic;
+        var input = holder.gameObject.AddComponent<TMP_InputField>();
+        input.textViewport = viewport;
+        input.textComponent = text;
+        input.placeholder = hint;
+        input.targetGraphic = back;
+        input.lineType = TMP_InputField.LineType.SingleLine;
+        input.onFocusSelectAll = false; // else the next key replaces everything typed so far
+        input.text = _filter;
+        input.onValueChanged.AddListener(value =>
+        {
+            _filter = value ?? "";
+            Fill();
+        });
+        if (_refocus)
+        {
+            _refocus = false;
+            holder.gameObject.AddComponent<MessagesFocus>().Input = input;
         }
     }
 
@@ -468,17 +651,25 @@ public static class MessagesPanel
         return content;
     }
 
-    private static void Button(RectTransform parent, string words, Action onClick, bool enabled, float width, bool selected)
+    private static void Button(RectTransform parent, string words, Action onClick, bool enabled, float width, bool selected, Color? tint = null)
     {
         var holder = Node(parent, "button " + words);
-        var rest = selected ? new Color32(197, 160, 72, 70) : enabled ? new Color32(231, 229, 212, 28) : new Color32(231, 229, 212, 10);
+        Color rest = selected ? new Color32(197, 160, 72, 70) : enabled ? new Color32(231, 229, 212, 28) : new Color32(231, 229, 212, 10);
+        if (tint.HasValue && !selected)
+        {
+            rest = new Color(tint.Value.r, tint.Value.g, tint.Value.b, 0.22f);
+        }
         var image = holder.gameObject.AddComponent<Image>();
         image.color = rest;
         var element = holder.gameObject.AddComponent<LayoutElement>();
         element.preferredWidth = element.minWidth = width;
         element.preferredHeight = element.minHeight = 42f;
         element.flexibleWidth = 0f;
-        var restInk = selected ? Gold : enabled ? Ink : new Color32(231, 229, 212, 70);
+        Color restInk = selected ? Gold : enabled ? Ink : new Color32(231, 229, 212, 70);
+        if (tint.HasValue && !selected)
+        {
+            restInk = tint.Value;
+        }
         var label = Text(holder, words, 18f, restInk, true);
         Stretch(label.rectTransform);
         label.alignment = TextAlignmentOptions.Center;
@@ -492,6 +683,23 @@ public static class MessagesPanel
         button.Usable = enabled;
         button.RestBack = rest;
         button.RestInk = restInk;
+    }
+}
+
+/// <summary>Puts the cursor back into the filter box after the window was rebuilt for a keystroke.</summary>
+public class MessagesFocus : MonoBehaviour
+{
+    public TMP_InputField Input;
+
+    private void Update()
+    {
+        if (Input != null)
+        {
+            Input.ActivateInputField();
+            Input.MoveTextEnd(false);
+        }
+
+        Destroy(this);
     }
 }
 

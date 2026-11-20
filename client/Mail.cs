@@ -28,6 +28,9 @@ public static class Mail
 
     private static bool _busy;
 
+    /// <summary>True: taken items go into the carried inventory; false: into the stash.</summary>
+    public static bool ToInventory;
+
     /// <summary>One message that holds items.</summary>
     public sealed class Msg
     {
@@ -113,7 +116,7 @@ public static class Mail
         }
     }
 
-    /// <summary>Takes one listed item into the carried inventory. True when it was taken.</summary>
+    /// <summary>Moves one listed item into the stash. True when it was taken.</summary>
     public static async System.Threading.Tasks.Task<bool> Take(Entry entry)
     {
         if (_busy)
@@ -134,10 +137,26 @@ public static class Mail
             StatsGuard.Begin(player.Profile);
             guarded = true;
 
-            if (!await LocalTrade.Give(player, entry.Root))
+            if (ToInventory)
             {
-                NotificationGate.Warn("No room for " + entry.Label + ". It stays in your messages.");
-                return false;
+                // into the carried inventory; what does not fit stays in the message
+                if (!await LocalTrade.Give(player, entry.Root))
+                {
+                    NotificationGate.Warn("No room in your inventory for " + entry.Label + ". It stays in your messages.");
+                    return false;
+                }
+            }
+            else
+            {
+                // the item goes straight into the stash (like items sent from the raid), not into the carried inventory
+                var flat = JArray.Parse(Singleton<ItemFactory>.Instance.TreeToFlatItems(new[] { entry.Root }).ToJson());
+                var stored = JObject.Parse(await RequestHandler.PostJsonAsync("/vagabond-openworld/mail/send", new JObject { ["Items"] = flat }.ToString(Formatting.None)));
+                if (!((bool?)stored["Ok"] ?? false))
+                {
+                    Plugin.LogError("Mail to stash failed: " + stored["Error"]);
+                    NotificationGate.Warn("Could not move " + entry.Label + " into the stash. It stays in your messages.");
+                    return false;
+                }
             }
 
             StatsGuard.Revert();
@@ -149,7 +168,7 @@ public static class Mail
             }
 
             Plugin.Log("Mail: took " + entry.Label);
-            NotificationGate.Message("Took " + entry.Label + ".");
+            NotificationGate.Message(entry.Label + (ToInventory ? " is in your inventory." : " is in your stash."));
             return true;
         }
         catch (Exception e)
@@ -209,7 +228,10 @@ public static class Mail
             }
 
             Plugin.Log("Sent to hideout: " + label);
-            NotificationGate.Message(label + " will be waiting in the hideout.");
+            var where = (string)reply["Where"];
+            NotificationGate.Message(where == "mail"
+                ? label + " is waiting in your messages (the stash has no room)."
+                : label + " is in your stash.");
             return true;
         }
         catch (Exception e)
